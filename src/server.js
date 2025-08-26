@@ -1,8 +1,8 @@
 // src/server.js
-// Veeam v8.1 MCP server (read‑only). Portable build that only imports from '@modelcontextprotocol/sdk' top-level.
-// Quiet by default; enable logs with --verbose or QUIET=0.
+// Veeam v8.1 MCP server (read‑only). "Omniloader" build for SDK path quirks.
+// - Tries multiple import paths for @modelcontextprotocol/sdk
+// - Quiet by default (use --verbose or set QUIET=0)
 
-import * as SDK from "@modelcontextprotocol/sdk";
 import { z } from "zod";
 import http from "node:http";
 import { TextDecoder } from "node:util";
@@ -10,32 +10,47 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fetch } from "undici";
 
 const PKG_NAME = "veeam-mcp-server";
-const VERSION = "0.1.9";
+const VERSION = "0.2.0";
 
 // ---------- Logging control ----------
 const QUIET = process.argv.includes("--quiet") || (!process.argv.includes("--verbose") && process.env.QUIET !== "0");
 const logInfo = (...a) => { if (!QUIET) console.error(...a); };
 const logErr  = (...a) => { console.error(...a); };
 
-// ---------- Resolve SDK symbols safely ----------
-const Server = SDK.Server || SDK.McpServer || SDK.default?.Server || SDK.default?.McpServer;
-const StdioServerTransport = SDK.StdioServerTransport || SDK.stdio?.StdioServerTransport || SDK.default?.StdioServerTransport;
-const SSEServerTransport = SDK.SSEServerTransport || SDK.sse?.SSEServerTransport || SDK.default?.SSEServerTransport;
-
-if (!Server || !StdioServerTransport) {
-  throw new Error("Incompatible @modelcontextprotocol/sdk: missing Server/McpServer or StdioServerTransport");
+// ---------- Dynamic SDK loader ----------
+async function loadSdk() {
+  const candidates = [
+    "@modelcontextprotocol/sdk",
+    "@modelcontextprotocol/sdk/index.js",
+    "@modelcontextprotocol/sdk/dist/esm/index.js",
+    "@modelcontextprotocol/sdk/dist/cjs/index.js",
+    "@modelcontextprotocol/sdk/server/index.js",
+    "@modelcontextprotocol/sdk/server/mcp.js",
+    "@modelcontextprotocol/sdk/dist/esm/server/index.js",
+    "@modelcontextprotocol/sdk/dist/cjs/server/index.js",
+  ];
+  const errors = [];
+  for (const id of candidates) {
+    try {
+      const mod = await import(id);
+      return { mod, id };
+    } catch (e) {
+      errors.push(`${id}: ${e?.message || e}`);
+    }
+  }
+  throw new Error("Unable to load @modelcontextprotocol/sdk via any known path:\n" + errors.join("\n"));
 }
 
-const server = new Server({ name: PKG_NAME, version: VERSION });
-
-// Polyfill: ensure both methods exist on 'server'
-if (typeof server.addTool !== "function" && typeof server.registerTool === "function") {
-  server.addTool = ({ name, description, inputSchema }, handler) =>
-    server.registerTool(name, { title: name, description, inputSchema }, handler);
-}
-if (typeof server.registerTool !== "function" && typeof server.addTool === "function") {
-  server.registerTool = (name, meta, handler) =>
-    server.addTool({ name, description: meta?.description, inputSchema: meta?.inputSchema }, handler);
+function pickSdk(mod) {
+  // Try new API first
+  const Server = mod.Server || mod?.default?.Server || mod?.McpServer || mod?.default?.McpServer;
+  // Transports
+  const StdioServerTransport = mod.StdioServerTransport || mod?.server?.StdioServerTransport || mod?.stdio?.StdioServerTransport || mod?.default?.StdioServerTransport;
+  const SSEServerTransport   = mod.SSEServerTransport   || mod?.server?.SSEServerTransport   || mod?.sse?.SSEServerTransport   || mod?.default?.SSEServerTransport;
+  if (!Server || !StdioServerTransport) {
+    throw new Error("SDK loaded but missing Server/McpServer or StdioServerTransport");
+  }
+  return { Server, StdioServerTransport, SSEServerTransport };
 }
 
 // ---------- Config ----------
@@ -152,7 +167,23 @@ function truncatePayload(payload) {
 }
 const toolResult = (obj, note) => ({ content: [{ type: "text", text: (note ? `NOTE: ${note}\n` : "") + safeStringify(obj) }] });
 
-// ---------- Define tools via server.addTool (polyfilled above) ----------
+// ---------- Main ----------
+const { mod: sdkMod, id: sdkPath } = await loadSdk();
+const { Server, StdioServerTransport, SSEServerTransport } = pickSdk(sdkMod);
+const server = new Server({ name: PKG_NAME, version: VERSION });
+
+// Ensure both APIs exist on instance
+if (typeof server.addTool !== "function" && typeof server.registerTool === "function") {
+  server.addTool = ({ name, description, inputSchema }, handler) =>
+    server.registerTool(name, { title: name, description, inputSchema }, handler);
+}
+if (typeof server.registerTool !== "function" && typeof server.addTool === "function") {
+  server.registerTool = (name, meta, handler) =>
+    server.addTool({ name, description: meta?.description, inputSchema: meta?.inputSchema }, handler);
+}
+logInfo(`[${PKG_NAME}] Loaded SDK from: ${sdkPath}`);
+
+// ---------- Define tools via server.addTool ----------
 const veeam = new VeeamClient({ baseUrl: BASE_URL, username: V_USER, password: V_PASS });
 
 const endpoints = {
@@ -212,11 +243,7 @@ async function start() {
     const httpServer = http.createServer(async (req, res) => {
       try {
         if (req.method === "GET" && req.url?.startsWith("/sse")) {
-          const transport = new (SSEServerTransport)(
-            // path for POST messages
-            "/messages",
-            res
-          );
+          const transport = new (SSEServerTransport)("/messages", res);
           transports.set(transport.sessionId, transport);
           res.on("close", () => transports.delete(transport.sessionId));
           logInfo(`[${PKG_NAME}] SSE connected. Tools: ${registered.length}`);
