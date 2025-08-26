@@ -1,11 +1,10 @@
 // src/server.js
-// Veeam v8.1 MCP server (read‑only). Works with both old/new MCP SDKs.
+// Veeam v8.1 MCP server (read‑only). Locks to McpServer.registerTool API for compatibility.
 // Transports: stdio (default) or --sse
 
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import * as NewApi from "@modelcontextprotocol/sdk/server/index.js"; // may export Server
-import * as OldApi from "@modelcontextprotocol/sdk/server/mcp.js";   // may export McpServer
 import { z } from "zod";
 import http from "node:http";
 import { TextDecoder } from "node:util";
@@ -13,7 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fetch } from "undici";
 
 const PKG_NAME = "veeam-mcp-server";
-const VERSION = "0.1.4";
+const VERSION = "0.1.5";
 
 // ---------- Config ----------
 const BASE_URL = process.env.VEEAM_BASE || "https://veeam.example.local";
@@ -129,18 +128,11 @@ function truncatePayload(payload) {
 }
 const toolResult = (obj, note) => ({ content: [{ type: "text", text: (note ? `NOTE: ${note}\n` : "") + safeStringify(obj) }] });
 
-// ---------- Server (compat old/new SDK) ----------
-const NewServer = NewApi.Server;
-const OldServer = OldApi.McpServer;
-const server = NewServer ? new NewServer({ name: PKG_NAME, version: VERSION })
-                         : new OldServer({ name: PKG_NAME, version: VERSION });
+// ---------- Server (locked to McpServer) ----------
+const server = new McpServer({ name: PKG_NAME, version: VERSION });
 
-function addToolCompat({ name, description, title, inputSchema }, handler) {
-  if (typeof server.addTool === "function") {
-    return server.addTool({ name, description, inputSchema }, handler);
-  }
-  const t = title || name.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-  return server.registerTool(name, { title: t, description, inputSchema }, handler);
+function addTool({ name, title, description, inputSchema }, handler) {
+  return server.registerTool(name, { title: title || name, description, inputSchema }, handler);
 }
 
 // ---------- Define tools ----------
@@ -169,28 +161,22 @@ const endpoints = {
 const registered = [];
 for (const [name, cfg] of Object.entries(endpoints)) {
   if (cfg.list) {
-    addToolCompat(
-      { name, description: `Read-only GET ${cfg.path}`, title: cfg.title, inputSchema: listInputSchema },
-      async (args = {}) => {
-        const params = listInputSchema.parse(args || {});
-        const data = await veeam.getList(cfg.path, params);
-        const { payload, note } = truncatePayload(data);
-        return toolResult(payload, note);
-      }
-    );
+    addTool({ name, title: cfg.title, description: `Read-only GET ${cfg.path}`, inputSchema: listInputSchema }, async (args = {}) => {
+      const params = listInputSchema.parse(args || {});
+      const data = await veeam.getList(cfg.path, params);
+      const { payload, note } = truncatePayload(data);
+      return toolResult(payload, note);
+    });
   } else {
     const byId = z.object({ [cfg.idParam || "id"]: z.string().describe("Resource ID") }).strict();
-    addToolCompat(
-      { name, description: `Read-only GET ${cfg.path}`, title: cfg.title, inputSchema: byId },
-      async (args = {}) => {
-        const parsed = byId.parse(args || {});
-        const id = parsed[cfg.idParam || "id"];
-        const path = cfg.path.replace("{id}", encodeURIComponent(String(id)));
-        const data = await veeam.get(path, {});
-        const { payload, note } = truncatePayload(data);
-        return toolResult(payload, note);
-      }
-    );
+    addTool({ name, title: cfg.title, description: `Read-only GET ${cfg.path}`, inputSchema: byId }, async (args = {}) => {
+      const parsed = byId.parse(args || {});
+      const id = parsed[cfg.idParam || "id"];
+      const path = cfg.path.replace("{id}", encodeURIComponent(String(id)));
+      const data = await veeam.get(path, {});
+      const { payload, note } = truncatePayload(data);
+      return toolResult(payload, note);
+    });
   }
   registered.push(name);
 }
@@ -233,7 +219,7 @@ async function start() {
   } else {
     const transport = new StdioServerTransport();
     console.error(`[${PKG_NAME}] stdio started. Tools: ${registered.length}`);
-    await (server.connect(transport));
+    await server.connect(transport);
   }
 }
 
