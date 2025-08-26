@@ -1,6 +1,6 @@
 // src/server.js
-// Veeam v8.1 MCP server (read‑only). Locks to McpServer.registerTool API for compatibility.
-// Transports: stdio (default) or --sse
+// Veeam v8.1 MCP server (read‑only). Quiet-by-default logging to keep RooCode clean.
+// Uses McpServer.registerTool API for broad compatibility. Transports: stdio (default) or --sse.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -12,7 +12,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fetch } from "undici";
 
 const PKG_NAME = "veeam-mcp-server";
-const VERSION = "0.1.5";
+const VERSION = "0.1.6";
+
+// ---------- Logging control ----------
+// Default QUIET on; disable by --verbose or QUIET=0
+const QUIET = process.argv.includes("--quiet") || (!process.argv.includes("--verbose") && process.env.QUIET !== "0");
+const logInfo = (...a) => { if (!QUIET) console.error(...a); };
+const logErr  = (...a) => { console.error(...a); };
 
 // ---------- Config ----------
 const BASE_URL = process.env.VEEAM_BASE || "https://veeam.example.local";
@@ -128,12 +134,10 @@ function truncatePayload(payload) {
 }
 const toolResult = (obj, note) => ({ content: [{ type: "text", text: (note ? `NOTE: ${note}\n` : "") + safeStringify(obj) }] });
 
-// ---------- Server (locked to McpServer) ----------
+// ---------- Server ----------
 const server = new McpServer({ name: PKG_NAME, version: VERSION });
-
-function addTool({ name, title, description, inputSchema }, handler) {
-  return server.registerTool(name, { title: title || name, description, inputSchema }, handler);
-}
+const addTool = ({ name, title, description, inputSchema }, handler) =>
+  server.registerTool(name, { title: title || name, description, inputSchema }, handler);
 
 // ---------- Define tools ----------
 const veeam = new VeeamClient({ baseUrl: BASE_URL, username: V_USER, password: V_PASS });
@@ -192,7 +196,7 @@ async function start() {
           const transport = new SSEServerTransport("/messages", res);
           transports.set(transport.sessionId, transport);
           res.on("close", () => transports.delete(transport.sessionId));
-          console.error(`[${PKG_NAME}] SSE connected. Tools: ${registered.length}`);
+          logInfo(`[${PKG_NAME}] SSE connected. Tools: ${registered.length}`);
           await server.connect(transport);
           return;
         }
@@ -215,12 +219,12 @@ async function start() {
         res.statusCode = 404; res.end("Not Found");
       } catch (e) { res.statusCode = 500; res.end(String(e?.message || e)); }
     });
-    httpServer.listen(PORT, () => console.error(`[${PKG_NAME}] SSE listening on http://localhost:${PORT} (GET /sse, POST /messages). Tools: ${registered.length}`));
+    httpServer.listen(PORT, () => logInfo(`[${PKG_NAME}] SSE listening on http://localhost:${PORT} (GET /sse, POST /messages). Tools: ${registered.length}`));
   } else {
     const transport = new StdioServerTransport();
-    console.error(`[${PKG_NAME}] stdio started. Tools: ${registered.length}`);
+    logInfo(`[${PKG_NAME}] stdio started. Tools: ${registered.length}`);
     await server.connect(transport);
   }
 }
 
-start().catch(err => { console.error(`[${PKG_NAME}] Fatal:`, err); process.exit(1); });
+start().catch(err => { logErr(`[${PKG_NAME}] Fatal:`, err); process.exit(1); });
