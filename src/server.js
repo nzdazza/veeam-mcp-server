@@ -10,9 +10,10 @@ import http from "node:http";
 import { TextDecoder } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { fetch } from "undici";
+import { z } from "zod";
 
 const PKG_NAME = "veeam-mcp-server";
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 // --------- Config ---------
 const BASE_URL   = process.env.VEEAM_BASE || "https://veeam.example.local";
@@ -24,19 +25,15 @@ const PORT       = parseInt(process.env.PORT || "3000", 10);
 const MAX_BYTES   = 1_000_000; // ~1MB of JSON stringified payload
 const MAX_ITEMS   = 1000;      // max top-level items aggregated when paginating
 
-// Common input schema for list_* tools (JSON Schema draft-2020-12 style)
-const listInputSchema = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    offset: { type: "integer", minimum: 0, description: "Result offset (>=0)" },
-    limit:  { type: "integer", minimum: 1, maximum: 100, description: "Page size (1-100)" },
-    filter: { type: "string", description: "Filter expression (API-specific)" },
-    sort:   { type: "string", description: "Sort expression (API-specific)" },
-    search: { type: "string", description: "Search term" },
-    all:    { type: "boolean", description: "Fetch all pages automatically" }
-  }
-};
+// Common input schema for list_* tools (Zod)
+const listInputSchema = z.object({
+  offset: z.number().int().min(0).optional().describe("Result offset (>=0)"),
+  limit: z.number().int().min(1).max(100).optional().describe("Page size (1-100)"),
+  filter: z.string().optional().describe("Filter expression (API-specific)"),
+  sort: z.string().optional().describe("Sort expression (API-specific)"),
+  search: z.string().optional().describe("Search term"),
+  all: z.boolean().optional().describe("Fetch all pages automatically")
+}).strict();
 
 // --------- Minimal Veeam API client with token refresh ---------
 class VeeamClient {
@@ -280,28 +277,24 @@ for (const [name, cfg] of Object.entries(endpoints)) {
       description: `Read-only wrapper for GET ${cfg.path}`,
       inputSchema: listInputSchema
     }, async (args = {}) => {
-      const data = await veeam.getList(cfg.path, args || {});
+      const parsed = listInputSchema.parse(args || {});
+      const data = await veeam.getList(cfg.path, parsed);
       const { payload, truncated, note } = truncatePayload(data);
       return toolResult(payload, truncated ? note : undefined);
     });
   } else {
     // get-by-id style
-    const schema = {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        [cfg.idParam || "id"]: { type: "string", description: "Resource ID (GUID/identifier)" }
-      },
-      required: [cfg.idParam || "id"]
-    };
+    const schema = z.object({
+      [cfg.idParam || "id"]: z.string().describe("Resource ID (GUID/identifier)")
+    }).strict();
     server.registerTool(name, {
       title: cfg.title,
       description: `Read-only wrapper for GET ${cfg.path}`,
       inputSchema: schema
     }, async (args) => {
+      const parsed = schema.parse(args || {});
       const idParam = cfg.idParam || "id";
-      const id = args?.[idParam];
-      if (!id) throw new Error(`Missing required parameter '${idParam}'`);
+      const id = parsed[idParam];
       const path = cfg.path.replace("{id}", encodeURIComponent(String(id)));
       const data = await veeam.get(path, {});
       const { payload, truncated, note } = truncatePayload(data);
