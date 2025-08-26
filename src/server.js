@@ -1,7 +1,7 @@
 // src/server.js
-// Veeam v8.1 MCP server (read‑only). Hybrid QUIET build with SDK API polyfills.
-// - Quiet by default (use --verbose or QUIET=0 to see info logs)
-// - Works whether SDK exposes Server.addTool or McpServer.registerTool
+// Veeam v8.1 MCP server (read‑only). Failsafe QUIET build.
+// - Quiet by default (use --verbose or QUIET=0 for logs)
+// - Never calls server.addTool directly; uses addToolCompat() at runtime
 // - Transports: stdio (default) or --sse
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -15,7 +15,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fetch } from "undici";
 
 const PKG_NAME = "veeam-mcp-server";
-const VERSION = "0.1.7";
+const VERSION = "0.1.8";
 
 // ---------- Logging control ----------
 const QUIET = process.argv.includes("--quiet") || (!process.argv.includes("--verbose") && process.env.QUIET !== "0");
@@ -136,25 +136,26 @@ function truncatePayload(payload) {
 }
 const toolResult = (obj, note) => ({ content: [{ type: "text", text: (note ? `NOTE: ${note}\n` : "") + safeStringify(obj) }] });
 
-// ---------- Server (hybrid + polyfills) ----------
+// ---------- Server (construct + compat wrappers) ----------
 const NewServer = NewApi.Server;
 const OldServer = OldApi.McpServer;
 const server = NewServer ? new NewServer({ name: PKG_NAME, version: VERSION })
                          : new OldServer({ name: PKG_NAME, version: VERSION });
 
-// Polyfill whichever API surface is missing so we can always call server.addTool()
-if (typeof server.addTool !== "function" && typeof server.registerTool === "function") {
-  // Old -> New
-  server.addTool = ({ name, description, inputSchema }, handler) =>
-    server.registerTool(name, { title: name, description, inputSchema }, handler);
-}
-if (typeof server.registerTool !== "function" && typeof server.addTool === "function") {
-  // New -> Old (polyfill to avoid client code that calls registerTool)
-  server.registerTool = (name, meta, handler) =>
-    server.addTool({ name, description: meta?.description, inputSchema: meta?.inputSchema }, handler);
+function addToolCompat({ name, description, title, inputSchema }, handler) {
+  // Prefer addTool if present
+  if (typeof server.addTool === "function") {
+    return server.addTool({ name, description, inputSchema }, handler);
+  }
+  // Fallback to registerTool
+  if (typeof server.registerTool === "function") {
+    const t = title || name;
+    return server.registerTool(name, { title: t, description, inputSchema }, handler);
+  }
+  throw new Error("MCP server instance missing both addTool and registerTool");
 }
 
-// ---------- Define tools (always via addTool) ----------
+// ---------- Define tools using addToolCompat ----------
 const veeam = new VeeamClient({ baseUrl: BASE_URL, username: V_USER, password: V_PASS });
 
 const endpoints = {
@@ -180,8 +181,8 @@ const endpoints = {
 const registered = [];
 for (const [name, cfg] of Object.entries(endpoints)) {
   if (cfg.list) {
-    server.addTool(
-      { name, description: `Read-only GET ${cfg.path}`, inputSchema: listInputSchema },
+    addToolCompat(
+      { name, title: cfg.title, description: `Read-only GET ${cfg.path}`, inputSchema: listInputSchema },
       async (args = {}) => {
         const params = listInputSchema.parse(args || {});
         const data = await veeam.getList(cfg.path, params);
@@ -191,8 +192,8 @@ for (const [name, cfg] of Object.entries(endpoints)) {
     );
   } else {
     const byId = z.object({ [cfg.idParam || "id"]: z.string().describe("Resource ID") }).strict();
-    server.addTool(
-      { name, description: `Read-only GET ${cfg.path}`, inputSchema: byId },
+    addToolCompat(
+      { name, title: cfg.title, description: `Read-only GET ${cfg.path}`, inputSchema: byId },
       async (args = {}) => {
         const parsed = byId.parse(args || {});
         const id = parsed[cfg.idParam || "id"];
