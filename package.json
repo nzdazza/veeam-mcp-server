@@ -1,7 +1,7 @@
 {
   "name": "veeam-mcp-server",
-  "version": "0.1.2",
-  "description": "Model Context Protocol (MCP) server for Veeam v8.1 REST API (read-only). Supports stdio and SSE transports.",
+  "version": "0.1.4",
+  "description": "Model Context Protocol (MCP) server for Veeam v8.1 REST API (read-only). Supports stdio and SSE transports. Compatible with old/new MCP SDK APIs.",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
