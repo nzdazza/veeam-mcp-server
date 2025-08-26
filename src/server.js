@@ -1,13 +1,8 @@
 // src/server.js
-// Veeam v8.1 MCP server (read‑only). Failsafe QUIET build.
-// - Quiet by default (use --verbose or QUIET=0 for logs)
-// - Never calls server.addTool directly; uses addToolCompat() at runtime
-// - Transports: stdio (default) or --sse
+// Veeam v8.1 MCP server (read‑only). Portable build that only imports from '@modelcontextprotocol/sdk' top-level.
+// Quiet by default; enable logs with --verbose or QUIET=0.
 
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import * as NewApi from "@modelcontextprotocol/sdk/server/index.js"; // may export Server
-import * as OldApi from "@modelcontextprotocol/sdk/server/mcp.js";   // may export McpServer
+import * as SDK from "@modelcontextprotocol/sdk";
 import { z } from "zod";
 import http from "node:http";
 import { TextDecoder } from "node:util";
@@ -15,12 +10,33 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fetch } from "undici";
 
 const PKG_NAME = "veeam-mcp-server";
-const VERSION = "0.1.8";
+const VERSION = "0.1.9";
 
 // ---------- Logging control ----------
 const QUIET = process.argv.includes("--quiet") || (!process.argv.includes("--verbose") && process.env.QUIET !== "0");
 const logInfo = (...a) => { if (!QUIET) console.error(...a); };
 const logErr  = (...a) => { console.error(...a); };
+
+// ---------- Resolve SDK symbols safely ----------
+const Server = SDK.Server || SDK.McpServer || SDK.default?.Server || SDK.default?.McpServer;
+const StdioServerTransport = SDK.StdioServerTransport || SDK.stdio?.StdioServerTransport || SDK.default?.StdioServerTransport;
+const SSEServerTransport = SDK.SSEServerTransport || SDK.sse?.SSEServerTransport || SDK.default?.SSEServerTransport;
+
+if (!Server || !StdioServerTransport) {
+  throw new Error("Incompatible @modelcontextprotocol/sdk: missing Server/McpServer or StdioServerTransport");
+}
+
+const server = new Server({ name: PKG_NAME, version: VERSION });
+
+// Polyfill: ensure both methods exist on 'server'
+if (typeof server.addTool !== "function" && typeof server.registerTool === "function") {
+  server.addTool = ({ name, description, inputSchema }, handler) =>
+    server.registerTool(name, { title: name, description, inputSchema }, handler);
+}
+if (typeof server.registerTool !== "function" && typeof server.addTool === "function") {
+  server.registerTool = (name, meta, handler) =>
+    server.addTool({ name, description: meta?.description, inputSchema: meta?.inputSchema }, handler);
+}
 
 // ---------- Config ----------
 const BASE_URL = process.env.VEEAM_BASE || "https://veeam.example.local";
@@ -136,53 +152,34 @@ function truncatePayload(payload) {
 }
 const toolResult = (obj, note) => ({ content: [{ type: "text", text: (note ? `NOTE: ${note}\n` : "") + safeStringify(obj) }] });
 
-// ---------- Server (construct + compat wrappers) ----------
-const NewServer = NewApi.Server;
-const OldServer = OldApi.McpServer;
-const server = NewServer ? new NewServer({ name: PKG_NAME, version: VERSION })
-                         : new OldServer({ name: PKG_NAME, version: VERSION });
-
-function addToolCompat({ name, description, title, inputSchema }, handler) {
-  // Prefer addTool if present
-  if (typeof server.addTool === "function") {
-    return server.addTool({ name, description, inputSchema }, handler);
-  }
-  // Fallback to registerTool
-  if (typeof server.registerTool === "function") {
-    const t = title || name;
-    return server.registerTool(name, { title: t, description, inputSchema }, handler);
-  }
-  throw new Error("MCP server instance missing both addTool and registerTool");
-}
-
-// ---------- Define tools using addToolCompat ----------
+// ---------- Define tools via server.addTool (polyfilled above) ----------
 const veeam = new VeeamClient({ baseUrl: BASE_URL, username: V_USER, password: V_PASS });
 
 const endpoints = {
   // Infrastructure
-  list_tenants:          { path: "/api/v3/tenants", list: true,  title: "List Tenants" },
-  list_backup_servers:   { path: "/api/v3/infrastructure/backupServers", list: true, title: "List Backup Servers" },
-  list_jobs:             { path: "/api/v3/jobs", list: true, title: "List Jobs" },
+  list_tenants:          { path: "/api/v3/tenants", list: true },
+  list_backup_servers:   { path: "/api/v3/infrastructure/backupServers", list: true },
+  list_jobs:             { path: "/api/v3/jobs", list: true },
   // Protected VMs
-  list_protected_vms:    { path: "/api/v8/protectedItem/virtualMachines", list: true, title: "List Protected VMs" },
-  get_vm_details:        { path: "/api/v8/protectedItem/virtualMachines/{id}", list: false, idParam: "id", title: "Get VM Details" },
+  list_protected_vms:    { path: "/api/v8/protectedItem/virtualMachines", list: true },
+  get_vm_details:        { path: "/api/v8/protectedItem/virtualMachines/{id}", list: false, idParam: "id" },
   // Storage
-  list_repositories:     { path: "/api/v3/repositories", list: true, title: "List Repositories" },
-  get_repository:        { path: "/api/v3/repositories/{id}", list: false, idParam: "id", title: "Get Repository" },
-  list_sobr:             { path: "/api/v3/backupInfrastructure/sobr", list: true, title: "List SOBR" },
-  get_sobr:              { path: "/api/v3/backupInfrastructure/sobr/{id}", list: false, idParam: "id", title: "Get SOBR" },
-  list_sobr_extents:     { path: "/api/v3/backupInfrastructure/sobr/{id}/extents", list: true, idParam: "id", requireId: true, title: "List SOBR Extents" },
-  list_object_storage:   { path: "/api/v3/objectStorage", list: true, title: "List Object Storage" },
-  get_object_storage:    { path: "/api/v3/objectStorage/{id}", list: false, idParam: "id", title: "Get Object Storage" },
-  list_storage_systems:  { path: "/api/v3/storageSystems", list: true, title: "List Storage Systems" },
-  get_storage_system:    { path: "/api/v3/storageSystems/{id}", list: false, idParam: "id", title: "Get Storage System" },
+  list_repositories:     { path: "/api/v3/repositories", list: true },
+  get_repository:        { path: "/api/v3/repositories/{id}", list: false, idParam: "id" },
+  list_sobr:             { path: "/api/v3/backupInfrastructure/sobr", list: true },
+  get_sobr:              { path: "/api/v3/backupInfrastructure/sobr/{id}", list: false, idParam: "id" },
+  list_sobr_extents:     { path: "/api/v3/backupInfrastructure/sobr/{id}/extents", list: true, idParam: "id", requireId: true },
+  list_object_storage:   { path: "/api/v3/objectStorage", list: true },
+  get_object_storage:    { path: "/api/v3/objectStorage/{id}", list: false, idParam: "id" },
+  list_storage_systems:  { path: "/api/v3/storageSystems", list: true },
+  get_storage_system:    { path: "/api/v3/storageSystems/{id}", list: false, idParam: "id" },
 };
 
 const registered = [];
 for (const [name, cfg] of Object.entries(endpoints)) {
   if (cfg.list) {
-    addToolCompat(
-      { name, title: cfg.title, description: `Read-only GET ${cfg.path}`, inputSchema: listInputSchema },
+    server.addTool(
+      { name, description: `Read-only GET ${cfg.path}`, inputSchema: listInputSchema },
       async (args = {}) => {
         const params = listInputSchema.parse(args || {});
         const data = await veeam.getList(cfg.path, params);
@@ -192,8 +189,8 @@ for (const [name, cfg] of Object.entries(endpoints)) {
     );
   } else {
     const byId = z.object({ [cfg.idParam || "id"]: z.string().describe("Resource ID") }).strict();
-    addToolCompat(
-      { name, title: cfg.title, description: `Read-only GET ${cfg.path}`, inputSchema: byId },
+    server.addTool(
+      { name, description: `Read-only GET ${cfg.path}`, inputSchema: byId },
       async (args = {}) => {
         const parsed = byId.parse(args || {});
         const id = parsed[cfg.idParam || "id"];
@@ -215,7 +212,11 @@ async function start() {
     const httpServer = http.createServer(async (req, res) => {
       try {
         if (req.method === "GET" && req.url?.startsWith("/sse")) {
-          const transport = new SSEServerTransport("/messages", res);
+          const transport = new (SSEServerTransport)(
+            // path for POST messages
+            "/messages",
+            res
+          );
           transports.set(transport.sessionId, transport);
           res.on("close", () => transports.delete(transport.sessionId));
           logInfo(`[${PKG_NAME}] SSE connected. Tools: ${registered.length}`);
@@ -243,7 +244,7 @@ async function start() {
     });
     httpServer.listen(PORT, () => logInfo(`[${PKG_NAME}] SSE listening on http://localhost:${PORT} (GET /sse, POST /messages). Tools: ${registered.length}`));
   } else {
-    const transport = new StdioServerTransport();
+    const transport = new (StdioServerTransport)();
     logInfo(`[${PKG_NAME}] stdio started. Tools: ${registered.length}`);
     await server.connect(transport);
   }

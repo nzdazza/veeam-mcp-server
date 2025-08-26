@@ -1,7 +1,7 @@
 {
   "name": "veeam-mcp-server",
-  "version": "0.1.8",
-  "description": "MCP server for Veeam v8.1 REST API (read-only). Failsafe quiet build using runtime addToolCompat/registerToolCompat.",
+  "version": "0.1.9",
+  "description": "MCP server for Veeam v8.1 REST API (read-only). Portable build using top-level SDK imports only.",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
@@ -25,7 +25,7 @@
   },
   "preferGlobal": true,
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.4",
+    "@modelcontextprotocol/sdk": "1.17.4",
     "undici": "^6.19.8",
     "zod": "^3.23.8"
   }
