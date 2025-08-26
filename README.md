@@ -1,19 +1,17 @@
-# veeam-mcp-server
+# veeam-mcp-server (quiet build)
 
-MCP server for **Veeam v8.1 REST API** (read-only).  
-**Locked to `McpServer.registerTool`** for maximum client compatibility (RooCode, Inspector, Copilot).  
-Transports: **stdio** (default) and **SSE** (`--sse`).
-
-## Tools
-Infrastructure: `list_tenants`, `list_backup_servers`, `list_jobs`  
-Protected VMs: `list_protected_vms`, `get_vm_details`  
-Storage: `list_repositories`, `get_repository`, `list_sobr`, `get_sobr`, `list_sobr_extents`, `list_object_storage`, `get_object_storage`, `list_storage_systems`, `get_storage_system`
+- Quiet-by-default (no info logs unless you pass `--verbose` or `QUIET=0`)
+- Transports: stdio (default), SSE (`--sse`)
+- Tools: 14 read-only endpoints for Veeam v8.1
+- Auth: username+password -> OAuth2 `/api/v3/token` with refresh
 
 ## Run
 ```bash
 npm install
-npm start            # stdio (preferred for RooCode)
-npm run start:sse    # SSE on PORT (default 3000)
+# stdio
+node src/server.js
+# verbose mode (show startup info)
+node src/server.js --verbose
+# or
+QUIET=0 node src/server.js
 ```
-
-Env: `VEEAM_BASE`, `VEEAM_USER`, `VEEAM_PASS`, `PORT`
