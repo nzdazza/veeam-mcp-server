@@ -1,10 +1,13 @@
 // src/server.js
-// Veeam v8.1 MCP server (read‑only). Quiet-by-default logging to keep RooCode clean.
-// Uses McpServer.registerTool API for broad compatibility. Transports: stdio (default) or --sse.
+// Veeam v8.1 MCP server (read‑only). Hybrid QUIET build with SDK API polyfills.
+// - Quiet by default (use --verbose or QUIET=0 to see info logs)
+// - Works whether SDK exposes Server.addTool or McpServer.registerTool
+// - Transports: stdio (default) or --sse
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import * as NewApi from "@modelcontextprotocol/sdk/server/index.js"; // may export Server
+import * as OldApi from "@modelcontextprotocol/sdk/server/mcp.js";   // may export McpServer
 import { z } from "zod";
 import http from "node:http";
 import { TextDecoder } from "node:util";
@@ -12,10 +15,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fetch } from "undici";
 
 const PKG_NAME = "veeam-mcp-server";
-const VERSION = "0.1.6";
+const VERSION = "0.1.7";
 
 // ---------- Logging control ----------
-// Default QUIET on; disable by --verbose or QUIET=0
 const QUIET = process.argv.includes("--quiet") || (!process.argv.includes("--verbose") && process.env.QUIET !== "0");
 const logInfo = (...a) => { if (!QUIET) console.error(...a); };
 const logErr  = (...a) => { console.error(...a); };
@@ -134,12 +136,25 @@ function truncatePayload(payload) {
 }
 const toolResult = (obj, note) => ({ content: [{ type: "text", text: (note ? `NOTE: ${note}\n` : "") + safeStringify(obj) }] });
 
-// ---------- Server ----------
-const server = new McpServer({ name: PKG_NAME, version: VERSION });
-const addTool = ({ name, title, description, inputSchema }, handler) =>
-  server.registerTool(name, { title: title || name, description, inputSchema }, handler);
+// ---------- Server (hybrid + polyfills) ----------
+const NewServer = NewApi.Server;
+const OldServer = OldApi.McpServer;
+const server = NewServer ? new NewServer({ name: PKG_NAME, version: VERSION })
+                         : new OldServer({ name: PKG_NAME, version: VERSION });
 
-// ---------- Define tools ----------
+// Polyfill whichever API surface is missing so we can always call server.addTool()
+if (typeof server.addTool !== "function" && typeof server.registerTool === "function") {
+  // Old -> New
+  server.addTool = ({ name, description, inputSchema }, handler) =>
+    server.registerTool(name, { title: name, description, inputSchema }, handler);
+}
+if (typeof server.registerTool !== "function" && typeof server.addTool === "function") {
+  // New -> Old (polyfill to avoid client code that calls registerTool)
+  server.registerTool = (name, meta, handler) =>
+    server.addTool({ name, description: meta?.description, inputSchema: meta?.inputSchema }, handler);
+}
+
+// ---------- Define tools (always via addTool) ----------
 const veeam = new VeeamClient({ baseUrl: BASE_URL, username: V_USER, password: V_PASS });
 
 const endpoints = {
@@ -165,22 +180,28 @@ const endpoints = {
 const registered = [];
 for (const [name, cfg] of Object.entries(endpoints)) {
   if (cfg.list) {
-    addTool({ name, title: cfg.title, description: `Read-only GET ${cfg.path}`, inputSchema: listInputSchema }, async (args = {}) => {
-      const params = listInputSchema.parse(args || {});
-      const data = await veeam.getList(cfg.path, params);
-      const { payload, note } = truncatePayload(data);
-      return toolResult(payload, note);
-    });
+    server.addTool(
+      { name, description: `Read-only GET ${cfg.path}`, inputSchema: listInputSchema },
+      async (args = {}) => {
+        const params = listInputSchema.parse(args || {});
+        const data = await veeam.getList(cfg.path, params);
+        const { payload, note } = truncatePayload(data);
+        return toolResult(payload, note);
+      }
+    );
   } else {
     const byId = z.object({ [cfg.idParam || "id"]: z.string().describe("Resource ID") }).strict();
-    addTool({ name, title: cfg.title, description: `Read-only GET ${cfg.path}`, inputSchema: byId }, async (args = {}) => {
-      const parsed = byId.parse(args || {});
-      const id = parsed[cfg.idParam || "id"];
-      const path = cfg.path.replace("{id}", encodeURIComponent(String(id)));
-      const data = await veeam.get(path, {});
-      const { payload, note } = truncatePayload(data);
-      return toolResult(payload, note);
-    });
+    server.addTool(
+      { name, description: `Read-only GET ${cfg.path}`, inputSchema: byId },
+      async (args = {}) => {
+        const parsed = byId.parse(args || {});
+        const id = parsed[cfg.idParam || "id"];
+        const path = cfg.path.replace("{id}", encodeURIComponent(String(id)));
+        const data = await veeam.get(path, {});
+        const { payload, note } = truncatePayload(data);
+        return toolResult(payload, note);
+      }
+    );
   }
   registered.push(name);
 }
